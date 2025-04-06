@@ -51,7 +51,7 @@ MAX_RETRIES = 3
 RETRY_DELAY = 1
 MAX_WORKERS = 5
 MAX_REDIRECTS = 5  # Максимальное количество редиректов
-TIMEOUT = 30  # Увеличиваем timeout до 30 секунд
+TIMEOUT = 60
 
 # Функция для вычисления минимальной даты на основе текущей даты и количества месяцев
 def get_min_date() -> datetime.datetime:
@@ -407,8 +407,12 @@ class SitemapProcessor:
 
     def save_news_page(self, news_page: NewsPage, domain: str) -> Optional[int]:
         """Сохранить информацию о странице новостей в БД."""
+        # Проверяем, является ли домен новым
+        is_new_domain = self.is_new_domain(domain)
+
         # Проверяем дату публикации по минимальной допустимой дате
-        if news_page.publication_date is None or news_page.publication_date < self.min_date:
+        # Для новых доменов пропускаем эту проверку
+        if not is_new_domain and (news_page.publication_date is None or news_page.publication_date < self.min_date):
             months_ago = CHECK_LAST_MONTHS
             logger.debug(f"Skipping page {news_page.page_url} - publication date is older than {months_ago} months")
             self.site_stats[domain].pages_skipped += 1
@@ -813,8 +817,17 @@ class SitemapProcessor:
         namespace = root.tag.split('}')[0] + '}' if '}' in root.tag else ''
         logger.debug(f"XML namespace: {namespace}")
 
-        # Проверяем свежесть sitemap - есть ли в нем страницы с датой не старше CHECK_LAST_MONTHS месяцев
-        is_fresh = self.check_sitemap_freshness(root)
+        # Проверяем, существует ли этот домен в базе данных
+        is_new_domain = self.is_new_domain(domain)
+
+        # Для нового домена все sitemap считаются свежими
+        # Для существующих доменов проверяем содержимое sitemap
+        if is_new_domain:
+            is_fresh = True
+            logger.info(f"New domain detected: {domain}. Marking all sitemaps as fresh.")
+        else:
+            # Проверяем свежесть sitemap - есть ли в нем страницы с датой не старше CHECK_LAST_MONTHS месяцев
+            is_fresh = self.check_sitemap_freshness(root)
 
         # Сохраняем дочерний sitemap в БД, если его еще нет
         if parent_id:
@@ -916,8 +929,9 @@ class SitemapProcessor:
                 logger.debug(f"Skipping page {page_url} - publication date not found")
                 continue
 
-            # Пропускаем страницы с датой старше минимальной
-            if publication_date < self.min_date:
+            # Если это новый домен - сохраняем все страницы, независимо от даты
+            # Для существующих доменов - пропускаем страницы с датой старше минимальной
+            if not is_new_domain and publication_date < self.min_date:
                 months_ago = CHECK_LAST_MONTHS
                 logger.debug(f"Skipping page {page_url} - publication date is older than {months_ago} months")
                 self.site_stats[domain].pages_skipped += 1
@@ -1062,6 +1076,27 @@ class SitemapProcessor:
         print("\n" + "=" * 100)
         print(tabulate(table_data, headers=headers, tablefmt="grid"))
         print("=" * 100 + "\n")
+
+    def is_new_domain(self, domain: str) -> bool:
+        """
+        Проверяет, является ли домен новым (отсутствующим в базе данных).
+        Возвращает True, если домен новый, иначе False.
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cursor:
+                try:
+                    cursor.execute(
+                        "SELECT COUNT(*) FROM sitemaps WHERE domain = %s",
+                        (domain,)
+                    )
+                    result = cursor.fetchone()
+
+                    # Если количество записей > 0, то домен уже существует
+                    return result[0] == 0
+                except psycopg2.Error as e:
+                    logger.error(f"Error checking if domain {domain} is new: {e}")
+                    # В случае ошибки считаем домен существующим (более безопасное поведение)
+                    return False
 
 def main():
     """Основная функция программы."""
