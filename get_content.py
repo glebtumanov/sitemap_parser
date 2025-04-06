@@ -14,20 +14,22 @@ from tabulate import tabulate
 from collections import defaultdict
 import concurrent.futures
 import threading
+import multiprocessing
 
 # Импорт библиотек для извлечения контента
 import trafilatura
 
 # Константы
-NUM_PAGES_FROM_DOMAIN = 1000  # Максимальное количество страниц с одного домена
+NUM_PAGES_FROM_DOMAIN = 5000  # Максимальное количество страниц с одного домена
 CONFIG_PATH = "config/config.ini"
 COOKIES_DIR = "cookies"  # Директория с файлами cookie
 LOGS_DIR = "logs"  # Директория для логов
 MAX_RETRIES = 3  # Максимальное количество повторных попыток
-MAX_WORKERS = 50  # Максимальное количество параллельных потоков
+MAX_WORKERS = 10  # Максимальное количество параллельных потоков
 MAX_CONCURRENT_PER_DOMAIN = 5 # Максимальное количество параллельных запросов к одному домену
 MAX_REDIRECTS = 5  # Максимальное количество редиректов
 REQUEST_TIMEOUT = 40  # Таймаут запросов в секундах
+N_JOBS = max(1, multiprocessing.cpu_count() - 1)  # Количество процессов для параллельной обработки (оставляем 1 ядро для системы)
 
 # Статистика выполнения
 stats = {
@@ -613,7 +615,34 @@ def process_page_content_extraction(page, db_config):
 
     return success
 
-def process_pages(pages, process_func, db_config):
+def process_content_extraction_batch(pages_batch, db_config_dict):
+    """Обработка пачки страниц для извлечения контента в отдельном процессе"""
+    results = []
+    # Преобразуем db_config_dict обратно в объект для использования с psycopg2
+    for page in pages_batch:
+        try:
+            success = process_page_content_extraction(page, db_config_dict)
+            results.append(success)
+            logger.info(f"Extracted content for page ID={page['id_page']} ({page['page_url']})")
+        except Exception as e:
+            logger.error(f"Error extracting content for page ID={page['id_page']}: {e}")
+            results.append(False)
+    return results
+
+def process_pages(pages, process_func, db_config, use_multiprocessing=False):
+    """
+    Параллельная обработка страниц с использованием ThreadPoolExecutor
+    или ProcessPoolExecutor в зависимости от параметра use_multiprocessing
+    """
+
+    # Если мультипроцессорная обработка не требуется или это функция скачивания контента
+    if not use_multiprocessing or process_func == process_page_raw_content:
+        return process_pages_threaded(pages, process_func, db_config)
+    else:
+        # Используем мультипроцессорную обработку для извлечения контента
+        return process_pages_multiprocessing(pages, db_config)
+
+def process_pages_threaded(pages, process_func, db_config):
     """Параллельная обработка страниц с использованием ThreadPoolExecutor"""
     results = []
 
@@ -622,7 +651,7 @@ def process_pages(pages, process_func, db_config):
     for page in pages:
         domain_pages[page['domain']].append(page)
 
-    logger.info(f"Starting to process {len(pages)} pages from {len(domain_pages)} different domains")
+    logger.info(f"Starting to process {len(pages)} pages from {len(domain_pages)} different domains using threads")
 
     # Блокировка для безопасного обновления счетчиков
     domain_lock = threading.Lock()
@@ -677,6 +706,38 @@ def process_pages(pages, process_func, db_config):
             except Exception as e:
                 logger.error(f"Error collecting result for {page['page_url']}: {e}")
                 results.append(False)
+
+    return results
+
+def process_pages_multiprocessing(pages, db_config):
+    """Параллельная обработка страниц с использованием ProcessPoolExecutor"""
+    results = []
+
+    logger.info(f"Starting to process {len(pages)} pages for content extraction using {N_JOBS} processes")
+
+    # Преобразуем db_config в словарь для передачи между процессами
+    db_config_dict = {k: db_config[k] for k in db_config}
+
+    # Равномерно распределяем страницы по процессам
+    batch_size = max(1, len(pages) // N_JOBS)
+    batches = [pages[i:i + batch_size] for i in range(0, len(pages), batch_size)]
+
+    # Обрабатываем страницы в параллельных процессах
+    with concurrent.futures.ProcessPoolExecutor(max_workers=N_JOBS) as executor:
+        # Запускаем выполнение для всех пачек
+        futures = {executor.submit(process_content_extraction_batch, batch, db_config_dict):
+                  i for i, batch in enumerate(batches)}
+
+        for future in concurrent.futures.as_completed(futures):
+            batch_index = futures[future]
+            try:
+                batch_results = future.result()
+                results.extend(batch_results)
+                logger.info(f"Completed batch {batch_index+1}/{len(batches)} with {len(batch_results)} pages")
+            except Exception as e:
+                logger.error(f"Error processing batch {batch_index+1}: {e}")
+                # Добавляем False для всех страниц в пачке
+                results.extend([False] * len(batches[batch_index]))
 
     return results
 
@@ -807,8 +868,8 @@ def main():
     logger.info(f"Found {len(pages_for_raw)} pages for raw content fetching")
 
     if pages_for_raw:
-        # Последовательная обработка для получения сырого контента
-        results_raw = process_pages(pages_for_raw, process_page_raw_content, db_config)
+        # Многопоточная обработка для получения сырого контента
+        results_raw = process_pages(pages_for_raw, process_page_raw_content, db_config, use_multiprocessing=False)
         success_count_raw = results_raw.count(True)
         logger.info(f"Processed {len(pages_for_raw)} raw pages, successful: {success_count_raw}, with errors: {len(pages_for_raw) - success_count_raw}")
     else:
@@ -821,8 +882,9 @@ def main():
     logger.info(f"Found {len(pages_for_extraction)} pages for content extraction")
 
     if pages_for_extraction:
-        # Последовательная обработка для извлечения контента
-        results_extraction = process_pages(pages_for_extraction, process_page_content_extraction, db_config)
+        # Используем мультипроцессорную обработку для извлечения контента
+        logger.info(f"Using {N_JOBS} processes for content extraction")
+        results_extraction = process_pages(pages_for_extraction, process_page_content_extraction, db_config, use_multiprocessing=True)
         success_count_extraction = results_extraction.count(True)
         logger.info(f"Processed {len(pages_for_extraction)} pages for extraction, successful: {success_count_extraction}, with errors: {len(pages_for_extraction) - success_count_extraction}")
     else:
