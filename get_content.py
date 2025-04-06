@@ -13,6 +13,7 @@ import random
 from tabulate import tabulate
 from collections import defaultdict
 import concurrent.futures
+import threading
 
 # Импорт библиотек для извлечения контента
 import trafilatura
@@ -23,8 +24,8 @@ CONFIG_PATH = "config/config.ini"
 COOKIES_DIR = "cookies"  # Директория с файлами cookie
 LOGS_DIR = "logs"  # Директория для логов
 MAX_RETRIES = 3  # Максимальное количество повторных попыток
-MAX_WORKERS = 10  # Максимальное количество параллельных потоков
-MAX_CONCURRENT_PER_DOMAIN = 2  # Максимальное количество параллельных запросов к одному домену
+MAX_WORKERS = 50  # Максимальное количество параллельных потоков
+MAX_CONCURRENT_PER_DOMAIN = 5 # Максимальное количество параллельных запросов к одному домену
 MAX_REDIRECTS = 5  # Максимальное количество редиректов
 REQUEST_TIMEOUT = 40  # Таймаут запросов в секундах
 
@@ -59,7 +60,7 @@ def setup_logging():
     # Добавляем обработчик для вывода в консоль с цветами
     logger.add(
         sys.stdout,
-        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{line}</cyan> : <level>{message}</level>",
         level="INFO",
         colorize=True
     )
@@ -68,7 +69,7 @@ def setup_logging():
     log_file_path = os.path.join(LOGS_DIR, "page_fetcher_{time}.log")
     logger.add(
         log_file_path,
-        format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {line} : {message}",
         level="INFO",
         rotation="1 day",
         retention=10
@@ -259,7 +260,7 @@ def save_raw_content_to_db(conn, content_info):
             )
         conn.commit()
         status = "successfully" if content_info['page_raw_content'] else "with error"
-        logger.info(f"Raw content for page ID={content_info['id_page']} saved to DB {status}")
+        logger.debug(f"Raw content for page ID={content_info['id_page']} saved to DB {status}")
         return True
     except Exception as e:
         conn.rollback()
@@ -399,7 +400,7 @@ def load_cookies(domain):
     latest_file = max(date_files, key=lambda x: x[0])[1]
     cookie_path = os.path.join(COOKIES_DIR, latest_file)
 
-    logger.info(f"Using cookie file: {latest_file}")
+    logger.debug(f"Using cookie file: {latest_file}")
 
     try:
         with open(cookie_path, 'r') as f:
@@ -436,6 +437,9 @@ def fetch_page_content(page_info, retry=0, redirect_count=0):
     if not domain:
         domain = extract_domain_from_url(url)
 
+    # Сохраняем оригинальный домен для проверки редиректов
+    original_domain = domain
+
     # Загрузка cookies
     cookies_list = load_cookies(domain)
     cookies_dict = cookies_to_dict(cookies_list)
@@ -465,7 +469,21 @@ def fetch_page_content(page_info, retry=0, redirect_count=0):
                 redirect_url = f"{base_url}{redirect_url if redirect_url.startswith('/') else '/' + redirect_url}"
 
             if redirect_url:
-                logger.info(f"Редирект {redirect_count+1}/{MAX_REDIRECTS}: {url} -> {redirect_url}")
+                # Проверяем домен редиректа
+                redirect_domain = extract_domain_from_url(redirect_url)
+
+                # Разрешаем редирект только в рамках того же домена или на www-версию
+                allowed_redirect = (
+                    redirect_domain == original_domain or
+                    f"www.{original_domain}" == redirect_domain
+                )
+
+                if not allowed_redirect:
+                    logger.warning(f"Заблокирован редирект на другой домен: {url} -> {redirect_url} ({original_domain} -> {redirect_domain})")
+                    # Возвращаем ошибку, не следуем редиректу на другой домен
+                    raise requests.exceptions.InvalidURL(f"Редирект на другой домен не разрешен: {redirect_domain}")
+
+                logger.debug(f"Редирект {redirect_count+1}/{MAX_REDIRECTS}: {url} -> {redirect_url}")
 
                 # Создаем новый page_info с обновленным URL
                 new_page_info = page_info.copy()
@@ -599,48 +617,65 @@ def process_pages(pages, process_func, db_config):
     """Параллельная обработка страниц с использованием ThreadPoolExecutor"""
     results = []
 
-    # Распределение страниц по доменам для ограничения параллельных запросов к одному домену
+    # Распределение страниц по доменам для управления параллелизмом
     domain_pages = defaultdict(list)
     for page in pages:
         domain_pages[page['domain']].append(page)
 
-    # Обрабатываем каждый домен отдельно с ограничением параллельных запросов
+    logger.info(f"Starting to process {len(pages)} pages from {len(domain_pages)} different domains")
+
+    # Блокировка для безопасного обновления счетчиков
+    domain_lock = threading.Lock()
+
+    # Используем словарь для отслеживания числа параллельных запросов к домену
+    domain_counters = {domain: 0 for domain in domain_pages.keys()}
+
+    def wrapped_process_func(page):
+        domain = page['domain']
+
+        # Атомарно увеличиваем счетчик запросов для домена
+        with domain_lock:
+            if domain_counters[domain] >= MAX_CONCURRENT_PER_DOMAIN:
+                # Если достигнут лимит для домена, задержка
+                logger.debug(f"Waiting for domain {domain} (active {domain_counters[domain]})")
+                time.sleep(random.uniform(0.5, 1.5))
+
+            # Увеличиваем счетчик текущих запросов к домену
+            domain_counters[domain] += 1
+
+        try:
+            # Обрабатываем страницу
+            result = process_func(page, db_config)
+            return result
+        except Exception as e:
+            logger.error(f"Error processing page {page['page_url']}: {e}")
+            return False
+        finally:
+            # Атомарно уменьшаем счетчик запросов для домена
+            with domain_lock:
+                domain_counters[domain] -= 1
+
+    # Создаем плоский список всех страниц для обработки
+    all_pages = []
+    for domain_pages_list in domain_pages.values():
+        all_pages.extend(domain_pages_list)
+
+    # Перемешиваем страницы для более равномерного распределения доменов
+    random.shuffle(all_pages)
+
+    # Обрабатываем все страницы параллельно с учетом ограничений
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # Держим учет всех запущенных задач
-        all_futures = []
+        # Запускаем выполнение для всех страниц
+        futures = {executor.submit(wrapped_process_func, page): page for page in all_pages}
 
-        # Для каждого домена запускаем обработку его страниц
-        for domain, domain_page_list in domain_pages.items():
-            # Разбиваем страницы домена на батчи для ограничения параллельности
-            batches = [domain_page_list[i:i + MAX_CONCURRENT_PER_DOMAIN]
-                     for i in range(0, len(domain_page_list), MAX_CONCURRENT_PER_DOMAIN)]
-
-            # Обрабатываем батчи последовательно
-            for batch in batches:
-                batch_futures = []
-                for page in batch:
-                    future = executor.submit(process_func, page, db_config)
-                    batch_futures.append(future)
-                    all_futures.append((future, page))
-
-                # Ждем завершения текущего батча перед запуском следующего
-                for future in concurrent.futures.as_completed(batch_futures):
-                    try:
-                        future.result()
-                    except Exception as e:
-                        logger.error(f"Exception in batch processing: {e}")
-
-                # Небольшая задержка между батчами одного домена
-                time.sleep(random.uniform(0.2, 0.5))
-
-        # Собираем результаты всех задач
-        for future, page in all_futures:
+        for future in concurrent.futures.as_completed(futures):
+            page = futures[future]
             try:
                 result = future.result()
                 results.append(result)
-                logger.info(f"Completed processing page: {page['page_url']}")
+                logger.info(f"Done page: {page['page_url']}")
             except Exception as e:
-                logger.error(f"Exception processing page {page['page_url']}: {e}")
+                logger.error(f"Error collecting result for {page['page_url']}: {e}")
                 results.append(False)
 
     return results

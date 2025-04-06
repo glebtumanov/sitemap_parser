@@ -49,7 +49,7 @@ def show_monthly_stats(conn):
     JOIN news_pages np ON s.id_sitemap = np.id_sitemap
     JOIN news_pages_content npc ON np.id_page = npc.id_page
     WHERE npc.content IS NOT NULL
-      AND npc.publication_date >= date_trunc('month', current_date) - interval '5 months'
+    AND npc.publication_date >= '2024-04-01'
     GROUP BY s.domain, month
     ORDER BY s.domain, month DESC;
     """

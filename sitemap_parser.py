@@ -26,7 +26,7 @@ logger.add(
     sink=lambda msg: print(msg, end=""),
     colorize=True,
     level="INFO",
-    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
+    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{line}</cyan> : <level>{message}</level>"
 )
 # Добавляем обработчик для записи в файл с ротацией (хранить только 10 последних запусков)
 os.makedirs("logs", exist_ok=True)
@@ -35,7 +35,7 @@ logger.add(
     rotation="1 day",
     retention=10,
     level="DEBUG",
-    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}"
+    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {line} : {message}"
 )
 
 # Путь к файлу со списком мастер-sitemap
