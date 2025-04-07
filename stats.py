@@ -76,8 +76,8 @@ def show_domain_stats(conn):
         COUNT(npc.id_page) AS pages_in_news_pages_content,
         COUNT(CASE WHEN npc.content IS NOT NULL AND npc.content <> '' THEN 1 END) AS pages_with_non_empty_content,
         COUNT(DISTINCT ce.id_page) AS pages_with_embeddings,
-        MIN(np.publication_date)::date AS min_publication_date,
-        MAX(np.publication_date)::date AS max_publication_date
+        MIN(np.publication_date) FILTER (WHERE ce.id_page IS NOT NULL)::date AS min_publication_date,
+        MAX(np.publication_date) FILTER (WHERE ce.id_page IS NOT NULL)::date AS max_publication_date
     FROM sitemaps s
     JOIN news_pages np ON s.id_sitemap = np.id_sitemap
     LEFT JOIN news_pages_content npc ON np.id_page = npc.id_page
@@ -95,11 +95,37 @@ def show_domain_stats(conn):
 
     headers = ["№", "Домен", "Всего\nстраниц", "Страниц\nспарсено",
                "Страниц\nс контентом", "Страниц\nс эмбеддингами",
-               "Миним.\nдата", "Максим.\nдата"]
+               "Минимальная\nдата текстов\nс эмбеддингами", "Максимальная\nдата текстов\nс эмбеддингами"]
     colalign = ["right", "left", "right", "right", "right", "right", "right", "right"]
 
     print("\n📈 ОБЩАЯ СТАТИСТИКА СТРАНИЦ ПО ДОМЕНАМ")
     print(tabulate(numbered_results, headers=headers, tablefmt="pretty", colalign=colalign))
+
+def show_summary_stats(conn):
+    """Отображение общей итоговой статистики по всем доменам"""
+    query = """
+    SELECT
+        COUNT(np.id_page) AS total_pages,
+        COUNT(npc.id_page) AS pages_in_news_pages_content,
+        COUNT(CASE WHEN npc.content IS NOT NULL AND npc.content <> '' THEN 1 END) AS pages_with_non_empty_content,
+        COUNT(DISTINCT ce.id_page) AS pages_with_embeddings,
+        MIN(np.publication_date) FILTER (WHERE ce.id_page IS NOT NULL)::date AS min_publication_date,
+        MAX(np.publication_date) FILTER (WHERE ce.id_page IS NOT NULL)::date AS max_publication_date
+    FROM sitemaps s
+    JOIN news_pages np ON s.id_sitemap = np.id_sitemap
+    LEFT JOIN news_pages_content npc ON np.id_page = npc.id_page
+    LEFT JOIN content_embeddings ce ON np.id_page = ce.id_page;
+    """
+
+    columns, results = execute_query(conn, query)
+
+    headers = ["Всего\nстраниц", "Страниц\nспарсено", "Страниц\nс контентом",
+               "Страниц\nс эмбеддингами", "Минимальная\nдата текстов\nс эмбеддингами",
+               "Максимальная\nдата текстов\nс эмбеддингами"]
+    colalign = ["right", "right", "right", "right", "right", "right"]
+
+    print("\n📊 ОБЩИЙ ИТОГ ПО ВСЕМ ДОМЕНАМ")
+    print(tabulate(results, headers=headers, tablefmt="pretty", colalign=colalign))
 
 def main():
     """Основная функция"""
@@ -112,6 +138,7 @@ def main():
             # Вывод статистики
             show_monthly_stats(conn)
             show_domain_stats(conn)
+            show_summary_stats(conn)
     except Exception as e:
         print(f"\n❌ Ошибка при выполнении: {e}")
 
